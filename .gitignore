@@ -1,0 +1,73 @@
+# Whitelist for the public repo: source, build scripts, measured game data, the built DLLs and item data, the
+# model-free templates, and the AN/PVS-30 bundle (3DMA's Personal licence allows free Tarkov mods). The AN/PVS-27
+# and UTC XII bundles must never be committed: CGTrader's terms are read strictly (players build them with
+# converter/build_pvs27.py and build_utc.py). Nothing of the AN/PVS-22 at all: its TurboSquid model is licensed
+# for editorial use only; its bundle, item data and processing live only in the private backup repo, force-added
+# there. No source model files at all.
+/*
+!/.gitignore
+!/README.md
+!/common/
+!/pvs22/
+!/clipons/
+!/converter/
+/converter/*
+!/converter/build_pvs27.py
+!/converter/build_utc.py
+!/converter/make_scripts.py
+!/converter/make_templates.py
+!/converter/reference.json
+!/converter/parts/
+!/converter/templates/
+!/make_release.py
+!/mods.py
+
+/pvs22/*
+!/pvs22/ClientSource/
+!/pvs22/ServerSource/
+/pvs22/ServerSource/*
+!/pvs22/ServerSource/PVS22Mod.cs
+!/pvs22/ServerSource/UstAchae.ClipOnSight.csproj
+!/pvs22/ServerSource/build.sh
+!/pvs22/ServerSource/bin/
+/pvs22/ServerSource/bin/*
+!/pvs22/ServerSource/bin/Release/
+/pvs22/ServerSource/bin/Release/*/*.pdb
+/pvs22/ServerSource/bin/Release/pvs22/
+!/pvs22/build_client.sh
+!/pvs22/top_rails.py
+!/pvs22/package/
+/pvs22/package/*
+!/pvs22/package/db/
+/pvs22/package/db/pvs22.json
+!/pvs22/package/client/
+
+!/pvs22/UnityProject/
+/pvs22/UnityProject/*
+!/pvs22/UnityProject/Packages/
+!/pvs22/UnityProject/ProjectSettings/
+!/pvs22/UnityProject/Assets/
+/pvs22/UnityProject/Assets/*
+!/pvs22/UnityProject/Assets/Editor/
+!/pvs22/UnityProject/Assets/Editor.meta
+!/pvs22/UnityProject/Assets/PVS22Stubs/
+!/pvs22/UnityProject/Assets/PVS22Stubs.meta
+
+/clipons/*
+!/clipons/items.py
+!/clipons/prepare.py
+!/clipons/native_look.py
+!/clipons/finalize_clipons.py
+!/clipons/make_catalogs.py
+!/clipons/install.py
+!/clipons/package/
+/clipons/package/*
+!/clipons/package/bundles/
+/clipons/package/bundles/*
+!/clipons/package/bundles/ustachae_clipons/
+/clipons/package/bundles/ustachae_clipons/*
+!/clipons/package/bundles/ustachae_clipons/pvs30.bundle
+!/clipons/package/bundles.json
+!/clipons/package/db/
+
+__pycache__/

@@ -1,0 +1,491 @@
+import argparse, hashlib, io, json, math, platform, subprocess, sys, tempfile, time, traceback, zipfile
+from pathlib import Path
+
+try:
+    import numpy as np
+    from PIL import Image
+    import UnityPy
+except ImportError as missing_package:
+    raise SystemExit(f'A Python package this script needs is missing ({missing_package.name}). Install them with:\n'
+                     f'  python -m pip install UnityPy numpy Pillow')
+
+TEX_SIZE = 2048
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Reading the purchase
+# ----------------------------------------------------------------------------------------------------------
+
+class Purchase:
+    """Files from the downloaded zips, including zips inside them, checked against the expected SHA-256."""
+    def __init__(self, paths):
+        self.outer = {name: zipfile.ZipFile(paths[name]) for name in SOURCE['archives']}
+        self.inner = {}
+
+    def read(self, name):
+        entry = SOURCE['files'][name]
+        archive, member, digest = entry if len(entry) == 3 else (SOURCE['archives'][0], *entry)
+        outer = self.outer[archive]
+        head, _, rest = member.partition('.zip/')
+        if rest:
+            if (archive, head) not in self.inner:
+                self.inner[archive, head] = zipfile.ZipFile(io.BytesIO(outer.read(head + '.zip')))
+            data = self.inner[archive, head].read(rest)
+        else:
+            data = outer.read(member)
+        got = hashlib.sha256(data).hexdigest()
+        if got != digest:
+            log(f'  {archive} / {member}: sha256 {got}, expected {digest}', show=False)
+            raise SystemExit(f'{member} in {archive} is not the version of the file this mod was made from '
+                             f'(the model may have been updated in the store)')
+        log(f'  {archive} / {member}: as expected', show=False)
+        return data
+
+    def image(self, name):
+        return Image.open(io.BytesIO(self.read(name)))
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Geometry and texture helpers
+# ----------------------------------------------------------------------------------------------------------
+
+def read_obj(text, with_normals=False):
+    V, VT, VN, faces, mat = [], [], [], [], None
+    for line in text.splitlines():
+        t = line.split()
+        if not t: continue
+        if t[0] == 'v': V.append([float(x) for x in t[1:4]])
+        elif t[0] == 'vt': VT.append([float(x) for x in t[1:3]])
+        elif t[0] == 'vn': VN.append([float(x) for x in t[1:4]])
+        elif t[0] == 'usemtl': mat = t[1]
+        elif t[0] == 'f':
+            if with_normals: faces.append((mat, [tuple(int(i) - 1 for i in c.split('/')) for c in t[1:]]))
+            else: faces.append((mat, [(int(c.split('/')[0]) - 1, int(c.split('/')[1]) - 1) for c in t[1:]]))
+    return np.array(V), np.array(VT), faces
+
+
+def face_normal(p):
+    n = np.cross(p, np.roll(p, -1, axis=0)).sum(0)  # Newell's method
+    return n / (np.linalg.norm(n) + 1e-12)
+
+
+def triangulate(p, n):
+    """Corner triples for polygon p (winding about normal n): a fan when that is valid, else ear clipping."""
+    m = len(p)
+    if all(np.cross(p[k] - p[0], p[k + 1] - p[0]) @ n > 0 for k in range(1, m - 1)):
+        return [(0, k, k + 1) for k in range(1, m - 1)]
+    left, out = list(range(m)), []
+    while len(left) > 3:
+        for j in range(len(left)):
+            a, b, c = left[j - 1], left[j], left[(j + 1) % len(left)]
+            if np.cross(p[b] - p[a], p[c] - p[a]) @ n <= 0: continue  # reflex corner
+            tri = (p[a], p[b], p[c])
+            inside = any(all(np.cross(tri[(e + 1) % 3] - tri[e], p[q] - tri[e]) @ n > 0 for e in range(3))
+                         for q in left if q not in (a, b, c))
+            if not inside:
+                out.append((a, b, c)); left.pop(j); break
+        else:  # numerically degenerate leftovers: close with a fan
+            out += [(left[0], left[k], left[k + 1]) for k in range(1, len(left) - 1)]; break
+    if len(left) == 3: out.append(tuple(left))
+    return out
+
+
+def corner_angles(V, faces):
+    """Vertex -> (face, corner angle) of every face using it."""
+    around = [[] for _ in V]
+    for fi, (_, corners) in enumerate(faces):
+        p = V[[c[0] for c in corners]]
+        for k, c in enumerate(corners):
+            a, b = p[k - 1] - p[k], p[(k + 1) % len(p)] - p[k]
+            around[c[0]].append((fi, np.arccos(np.clip(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12), -1, 1))))
+    return around
+
+
+def rgba(rgb, alpha=1.0):
+    """An 8-bit RGBA image from float channels in 0..1 (what the PNGs of the author's build hold)."""
+    return Image.fromarray((np.clip(np.dstack([rgb, np.broadcast_to(alpha, rgb.shape[:2])]), 0, 1) * 255).astype(np.uint8), 'RGBA')
+
+
+# Texture distribution targets measured from the Nightforce ATACR 7-35x56 body (the native reference).
+SPEC_P10, SPEC_P90 = 0.44, 0.65
+ALBEDO_SPREAD = 0.225 / 0.067
+
+
+def match_spec(spec, painted, p10=SPEC_P10, p90=SPEC_P90):
+    """Linearly remap the painted texels' 10th-90th percentile band onto the target band."""
+    lo, hi = np.percentile(spec[painted], [10, 90])
+    return np.clip(p10 + (spec - lo) / max(hi - lo, 1e-6) * (p90 - p10), 0.0, 1.0)
+
+
+def to_linear(c): return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def stretch_albedo(albedo, painted, spread=ALBEDO_SPREAD):
+    """Widen the brightness spread to the target p90/p10 ratio (each texel keeps its hue), then scale so the
+    painted texels' mean reflectance in linear light is what it was."""
+    lum = np.maximum(albedo.mean(-1), 1e-4)
+    p10, med, p90 = np.percentile(lum[painted], [10, 50, 90])
+    k = np.log(spread) / max(np.log(p90 / max(p10, 1e-4)), 1e-6)
+    target = np.exp(np.log(med) + (np.log(lum) - np.log(med)) * k)
+    mean_before = to_linear(albedo)[painted].mean()
+    out = albedo * (target / lum)[..., None]
+    for _ in range(4):
+        out = np.clip(out, 0.0, 1.0)
+        out = out * (mean_before / max(to_linear(out)[painted].mean(), 1e-6)) ** (1 / 2.4)
+    return np.clip(out, 0.0, 1.0)
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Writing into the template bundles
+# ----------------------------------------------------------------------------------------------------------
+
+def tangents(pos, nrm, uv, tris):
+    """Per-vertex tangents with handedness in w: each triangle's unit tangent and bitangent, weighted by its
+    corner angle at the vertex, summed and made orthogonal to the normal. Of the usual variants, the closest to
+    Unity's Mesh.RecalculateTangents, which the author's build uses (half the vertices within 0.01 degrees;
+    the rest differ by a few degrees at most, apart from triangles with almost no texture area)."""
+    t = tris.reshape(-1, 3)
+    p0, p1, p2 = pos[t[:, 0]], pos[t[:, 1]], pos[t[:, 2]]
+    w0, w1, w2 = uv[t[:, 0]], uv[t[:, 1]], uv[t[:, 2]]
+    e1, e2 = p1 - p0, p2 - p0
+    d1, d2 = w1 - w0, w2 - w0
+    r = d1[:, 0] * d2[:, 1] - d2[:, 0] * d1[:, 1]
+    r = np.where(np.abs(r) < 1e-20, 0.0, 1.0 / np.where(np.abs(r) < 1e-20, 1.0, r))
+    sdir = (e1 * d2[:, 1:2] - e2 * d1[:, 1:2]) * r[:, None]
+    tdir = (e2 * d1[:, 0:1] - e1 * d2[:, 0:1]) * r[:, None]
+    sdir /= np.maximum(np.linalg.norm(sdir, axis=1, keepdims=True), 1e-30)
+    tdir /= np.maximum(np.linalg.norm(tdir, axis=1, keepdims=True), 1e-30)
+    tan1 = np.zeros_like(pos); tan2 = np.zeros_like(pos)
+    corners = [p0, p1, p2]
+    for k in range(3):
+        u, v = corners[(k + 1) % 3] - corners[k], corners[(k + 2) % 3] - corners[k]
+        angle = np.arccos(np.clip((u * v).sum(1) / (np.linalg.norm(u, axis=1) * np.linalg.norm(v, axis=1) + 1e-30), -1, 1))[:, None]
+        np.add.at(tan1, t[:, k], sdir * angle)
+        np.add.at(tan2, t[:, k], tdir * angle)
+    tg = tan1 - nrm * (nrm * tan1).sum(1, keepdims=True)
+    length = np.linalg.norm(tg, axis=1, keepdims=True)
+    fallback = np.cross(nrm, np.array([0.0, 0.0, 1.0]))
+    fallback = np.where(np.linalg.norm(fallback, axis=1, keepdims=True) < 1e-6, np.cross(nrm, np.array([0.0, 1.0, 0.0])), fallback)
+    tg = np.where(length > 1e-12, tg / np.maximum(length, 1e-12), fallback / np.linalg.norm(fallback, axis=1, keepdims=True))
+    w = np.where((np.cross(nrm, tg) * tan2).sum(1) < 0.0, -1.0, 1.0)
+    return np.hstack([tg, w[:, None]])
+
+
+def aabb(points):
+    lo, hi = points.min(0), points.max(0)
+    return {'m_Center': dict(zip('xyz', map(float, (lo + hi) / 2))), 'm_Extent': dict(zip('xyz', map(float, (hi - lo) / 2)))}
+
+
+def write_mesh(obj, pos, nrm, uv, submeshes):
+    """Fills a template Mesh with the geometry: one interleaved float32 stream (position, normal, tangent,
+    uv) and 32-bit indices, the layout the Unity builder produces."""
+    t = obj.read_typetree()
+    tris = np.concatenate(submeshes).astype(np.int64)
+    tan = tangents(pos.astype(np.float64), nrm.astype(np.float64), uv.astype(np.float64), tris)
+    t['m_VertexData']['m_VertexCount'] = len(pos)
+    t['m_VertexData']['m_DataSize'] = np.hstack([pos, nrm, tan, uv]).astype('<f4').tobytes()
+    t['m_IndexFormat'] = 1
+    t['m_IndexBuffer'] = list(tris.astype('<u4').tobytes())
+    subs, first = [], 0
+    for s in submeshes:
+        s = np.asarray(s, np.int64)
+        subs.append({'firstByte': first * 4, 'indexCount': len(s), 'topology': 0, 'baseVertex': 0,
+                     'firstVertex': int(s.min()), 'vertexCount': int(s.max() - s.min() + 1), 'localAABB': aabb(pos[np.unique(s)])})
+        first += len(s)
+    t['m_SubMeshes'] = subs
+    t['m_LocalAABB'] = aabb(pos)
+    obj.save_typetree(t)
+
+
+def expand565(q):
+    """5:6:5 endpoint codes -> the 8-bit colour the GPU decodes."""
+    r, g, b = q[..., 0], q[..., 1], q[..., 2]
+    return np.stack([(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)], -1).astype(np.float64)
+
+
+def quantise565(c):
+    c = np.clip(c, 0, 255)
+    return np.stack([np.round(c[..., 0] * 31 / 255), np.round(c[..., 1] * 63 / 255), np.round(c[..., 2] * 31 / 255)], -1).astype(np.int64)
+
+
+def colour_blocks(px):
+    """BC1 colour blocks for (N, 16, 3) pixels: endpoints along the colours' principal axis, then refined by
+    least squares on the chosen indices (twice), always in four-colour mode. A quality close to Unity's own
+    compressor (the faster etcpak encoder UnityPy uses showed visible block errors)."""
+    mean = px.mean(1)
+    centred = px - mean[:, None]
+    cov = np.einsum('nki,nkj->nij', centred, centred)
+    axis = np.ones((len(px), 3)) / np.sqrt(3)
+    for _ in range(8):
+        axis = np.einsum('nij,nj->ni', cov, axis)
+        axis /= np.maximum(np.linalg.norm(axis, axis=1, keepdims=True), 1e-12)
+    proj = np.einsum('nki,ni->nk', centred, axis)
+    e0 = mean + axis * proj.max(1)[:, None]
+    e1 = mean + axis * proj.min(1)[:, None]
+    weights = np.array([1.0, 0.0, 2 / 3, 1 / 3])  # each index's share of endpoint 0
+    for _ in range(3):
+        d0, d1 = expand565(quantise565(e0)), expand565(quantise565(e1))
+        palette = np.stack([d0, d1, (2 * d0 + d1) / 3, (d0 + 2 * d1) / 3], 1)
+        idx = ((px[:, :, None, :] - palette[:, None, :, :]) ** 2).sum(-1).argmin(-1)
+        a = weights[idx]; b = 1 - a
+        aa, ab, bb = (a * a).sum(1), (a * b).sum(1), (b * b).sum(1)
+        det = aa * bb - ab * ab
+        ax, bx = np.einsum('nk,nki->ni', a, px), np.einsum('nk,nki->ni', b, px)
+        ok = np.abs(det) > 1e-9
+        safe = np.where(ok, det, 1.0)[:, None]
+        e0 = np.where(ok[:, None], (bb[:, None] * ax - ab[:, None] * bx) / safe, e0)
+        e1 = np.where(ok[:, None], (aa[:, None] * bx - ab[:, None] * ax) / safe, e1)
+    q0, q1 = quantise565(e0), quantise565(e1)
+    c0 = (q0[:, 0] << 11) | (q0[:, 1] << 5) | q0[:, 2]
+    c1 = (q1[:, 0] << 11) | (q1[:, 1] << 5) | q1[:, 2]
+    swap = c0 < c1  # four-colour mode needs the first endpoint larger
+    c0, c1 = np.where(swap, c1, c0), np.where(swap, c0, c1)
+    q0, q1 = np.where(swap[:, None], q1, q0), np.where(swap[:, None], q0, q1)
+    d0, d1 = expand565(q0), expand565(q1)
+    palette = np.stack([d0, d1, (2 * d0 + d1) / 3, (d0 + 2 * d1) / 3], 1)
+    idx = ((px[:, :, None, :] - palette[:, None, :, :]) ** 2).sum(-1).argmin(-1)
+    idx[c0 == c1] = 0
+    bits = (idx.astype(np.uint64) << (2 * np.arange(16, dtype=np.uint64))).sum(1)
+    out = np.zeros((len(px), 8), np.uint8)
+    out[:, 0:2] = c0.astype('<u2').view(np.uint8).reshape(-1, 2)
+    out[:, 2:4] = c1.astype('<u2').view(np.uint8).reshape(-1, 2)
+    out[:, 4:8] = bits.astype('<u4').view(np.uint8).reshape(-1, 4)
+    return out
+
+
+def alpha_blocks(alpha):
+    """BC3 alpha blocks for (N, 16) values: eight-step mode between the block's extremes, refined once by least
+    squares on the chosen indices."""
+    shares = np.array([1.0, 0.0, 6 / 7, 5 / 7, 4 / 7, 3 / 7, 2 / 7, 1 / 7])  # each index's share of endpoint 0
+    a0, a1 = alpha.max(1), alpha.min(1)
+    for refine in (True, False):
+        e0, e1 = np.round(a0), np.round(a1)
+        palette = shares * e0[:, None] + (1 - shares) * e1[:, None]
+        idx = np.abs(alpha[:, :, None] - palette[:, None, :]).argmin(-1)
+        if not refine: break
+        s = shares[idx]; t = 1 - s
+        ss, st, tt = (s * s).sum(1), (s * t).sum(1), (t * t).sum(1)
+        det = ss * tt - st * st
+        ok = np.abs(det) > 1e-9
+        safe = np.where(ok, det, 1.0)
+        sx, tx = (s * alpha).sum(1), (t * alpha).sum(1)
+        a0 = np.clip(np.where(ok, (tt * sx - st * tx) / safe, a0), 0, 255)
+        a1 = np.clip(np.where(ok, (ss * tx - st * sx) / safe, a1), 0, 255)
+    e0, e1 = e0.astype(np.int64), e1.astype(np.int64)
+    swap = e0 < e1  # eight-step mode needs the first endpoint larger: swap and renumber
+    e0, e1 = np.where(swap, e1, e0), np.where(swap, e0, e1)
+    idx = np.where(swap[:, None], np.array([1, 0, 7, 6, 5, 4, 3, 2])[idx], idx)
+    idx[e0 == e1] = 0
+    bits = (idx.astype(np.uint64) << (3 * np.arange(16, dtype=np.uint64))).sum(1)
+    out = np.zeros((len(alpha), 8), np.uint8)
+    out[:, 0], out[:, 1] = e0, e1
+    out[:, 2:8] = bits.astype('<u8').view(np.uint8).reshape(-1, 8)[:, :6]
+    return out
+
+
+def dxt_level(img, fmt):
+    """One mip level in DXT1 (10) or DXT5 (12), bottom row first as Unity stores it; levels under 4x4 are
+    padded to one block."""
+    if img.width < 4 or img.height < 4:
+        pad = Image.new(img.mode, (max(4, img.width), max(4, img.height)))
+        pad.paste(img, (0, 0)); img = pad
+    a = np.asarray(img.convert('RGBA').transpose(Image.Transpose.FLIP_TOP_BOTTOM)).astype(np.float64)
+    h, w = a.shape[0] // 4, a.shape[1] // 4
+    px = a[:h * 4, :w * 4].reshape(h, 4, w, 4, 4).transpose(0, 2, 1, 3, 4).reshape(-1, 16, 4)
+    out = []
+    for i in range(0, len(px), 32768):  # in parts, to keep the palette distances small in memory
+        part = px[i:i + 32768]
+        colour = colour_blocks(part[:, :, :3])
+        out.append(colour if fmt == 10 else np.hstack([alpha_blocks(part[:, :, 3]), colour]))
+    return np.vstack(out).tobytes()
+
+
+def write_texture(obj, img, normal_map=False, size=TEX_SIZE):
+    """Fills a template Texture2D: resized to at most `size`, a full box-filtered mip chain down to 1x1, in
+    the template's own compressed format. Normal maps go in Unity's layout (X in alpha, Y in green)."""
+    tex = obj.read()
+    fmt = tex.m_TextureFormat
+    img = img.convert('RGBA')
+    # Unity's import scales each side to the nearest power of two (the PVS-22's 283 px label became 256 px).
+    pot = lambda n: min(size, 1 << max(0, round(math.log2(n))))
+    if img.size != (pot(img.width), pot(img.height)):
+        img = img.resize((pot(img.width), pot(img.height)), Image.Resampling.LANCZOS)
+    levels, level = [], img
+    while True:
+        levels.append(level)
+        if level.width == 1 and level.height == 1: break
+        level = level.resize((max(1, level.width // 2), max(1, level.height // 2)), Image.Resampling.BOX)
+    data = b''
+    for lv in levels:
+        if normal_map:
+            a = np.asarray(lv).astype(np.float32) / 255 * 2 - 1
+            n = a[..., :3] / np.maximum(np.linalg.norm(a[..., :3], axis=-1, keepdims=True), 1e-6)
+            x, y = (n[..., 0] + 1) / 2, (n[..., 1] + 1) / 2
+            lv = Image.fromarray((np.stack([np.ones_like(x), y, y, x], -1) * 255 + 0.5).astype(np.uint8), 'RGBA')
+        data += dxt_level(lv, fmt)
+    tex.m_Width, tex.m_Height = img.width, img.height
+    tex.m_MipCount = len(levels)
+    tex.m_MipMap = True
+    tex.image_data = data
+    tex.m_CompleteImageSize = len(data)
+    if tex.m_StreamData is not None:
+        tex.m_StreamData.path, tex.m_StreamData.offset, tex.m_StreamData.size = '', 0, 0
+    tex.save()
+
+
+def fill_template(template, model, mesh, textures):
+    env = UnityPy.load(str(template))
+    meshes = filled = 0
+    for o in env.objects:
+        if o.type.name == 'Mesh' and o.read_typetree()['m_Name'] == model['mesh']:
+            write_mesh(o, *mesh); meshes += 1
+        elif o.type.name == 'Texture2D':
+            name = o.read().m_Name
+            if name in textures:
+                write_texture(o, textures[name], normal_map=name.endswith('normal')); filled += 1
+    if meshes != 1 or filled != len(model['textures']):
+        raise SystemExit(f'{template.name} does not match this script (mesh {meshes}, textures {filled})')
+    return env.file.save(packer='lz4')
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Command line
+# ----------------------------------------------------------------------------------------------------------
+
+LOG = None
+
+
+def log(message, show=True):
+    """A line on screen and in the log file next to this script, which a player can attach to an issue."""
+    if show: print(message, flush=True)
+    if LOG: LOG.write(time.strftime('%H:%M:%S ') + message + '\n'); LOG.flush()
+
+
+def sha256(data): return hashlib.sha256(data).hexdigest()
+
+
+def check_bundle(data, model):
+    """Reads a written bundle back: the mesh has geometry and every texture has pixels."""
+    env = UnityPy.load(data)
+    vertices, textures = 0, {}
+    for o in env.objects:
+        if o.type.name == 'Mesh' and o.read_typetree()['m_Name'] == model['mesh']:
+            vertices = o.read_typetree()['m_VertexData']['m_VertexCount']
+        elif o.type.name == 'Texture2D':
+            t = o.read()
+            if t.m_Name in model['textures']: textures[t.m_Name] = (t.m_Width, t.m_Height, len(t.image_data))
+    log(f'  check: mesh {vertices} vertices; textures ' + ', '.join(f'{n} {w}x{h}' for n, (w, h, _) in sorted(textures.items())), show=False)
+    if vertices == 0 or len(textures) != len(model['textures']) or not all(size for _, _, size in textures.values()):
+        raise SystemExit(f'the written bundle is incomplete (mesh {vertices} vertices, textures {textures})')
+
+
+def holds_purchase(zip_path, archive):
+    """Whether a zip is this purchase's download `archive`, whatever its file name: it holds the files used from it."""
+    wanted = {e[-2] for e in SOURCE['files'].values() if (e[0] if len(e) == 3 else SOURCE['archives'][0]) == archive}
+    try:
+        names = set(zipfile.ZipFile(zip_path).namelist())
+    except (OSError, zipfile.BadZipFile):
+        return False
+    return all((w.partition('.zip/')[0] + '.zip' if '.zip/' in w else w) in names for w in wanted)
+
+
+def find_archives(given):
+    """The purchase's zips from what the player gave: the zip itself (a purchase with one download), or the folder
+    holding the zips (without anything, the mod's folder). A zip is known by its contents, so a renamed one is found."""
+    if not given.exists():
+        raise SystemExit(f'{given} does not exist. Give the path of the model\'s zip (drag the zip into this window), '
+                         f'or the folder that holds it')
+    if given.is_file():
+        if len(SOURCE['archives']) == 1 and holds_purchase(given, SOURCE['archives'][0]):
+            return {SOURCE['archives'][0]: given}
+        raise SystemExit(f'{given} is not the download this script needs ({", ".join(SOURCE["archives"])}, unchanged and not unzipped)')
+    paths = {}
+    for archive in SOURCE['archives']:
+        if (given / archive).exists():
+            paths[archive] = given / archive
+            continue
+        renamed = [p for p in sorted(given.glob('*.zip')) if holds_purchase(p, archive)]
+        if renamed: paths[archive] = renamed[0]
+    missing = [a for a in SOURCE['archives'] if a not in paths]
+    if missing:
+        found = sorted(p.name for p in given.glob('*.zip'))
+        raise SystemExit(f'{", ".join(missing)} was not found in {given} (zips there: {", ".join(found) or "none"}). '
+                         f'Give the path of the model\'s zip (drag it into this window), and do not unzip it.')
+    return paths
+
+
+def run(args):
+    log(f'{Path(__file__).name} for {SOURCE["title"]}, mod {MOD_VERSION}')
+    log(f'Python {sys.version.split()[0]} on {platform.platform()}; numpy {np.__version__}, Pillow {Image.__version__}, '
+        f'UnityPy {getattr(UnityPy, "__version__", "?")}', show=False)
+    log(f'mod folder: {args.mod}', show=False)
+    log(f'model given: {args.models or "(none: the mod folder)"}', show=False)
+    if sys.version_info < (3, 10): raise SystemExit('Python 3.10 or newer is needed')
+    running = subprocess.run(['tasklist'], capture_output=True, text=True).stdout if sys.platform == 'win32' else ''
+    for exe in ('SPT.Server.exe', 'EscapeFromTarkov.exe'):
+        if exe in running: raise SystemExit(f'{exe} is running; close the SPT server and the game first')
+    templates = args.mod / 'templates'
+    if not templates.is_dir():
+        raise SystemExit(f'there is no templates folder in {args.mod}. The mod\'s release zip puts it next to this script: '
+                         f'unzip the whole zip into the game folder again (or, if this script was copied elsewhere, pass --mod <the mod\'s folder>)')
+    for key in MODELS:
+        template = templates / f'{key}.bundle.template'
+        if not template.exists(): raise SystemExit(f'{template} is missing: reinstall the mod')
+        log(f'template {template.name}: {sha256(template.read_bytes())}', show=False)
+    paths = find_archives(args.models or args.mod)
+    for archive, path in paths.items():
+        data = path.read_bytes()
+        log(f'{archive}: {path}, {len(data)} bytes, sha256 {sha256(data)}', show=False)
+
+    log('reading ' + SOURCE['title'])
+    with tempfile.TemporaryDirectory() as tmp:
+        jobs = build(Purchase(paths), args, Path(tmp))
+        for key, (mesh, textures) in jobs.items():
+            model = MODELS[key]
+            data = fill_template(templates / f'{key}.bundle.template', model, mesh, textures)
+            check_bundle(data, model)
+            out = args.mod / 'bundles' / model['bundle']
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+            digest = sha256(data)
+            same = 'identical to the author\'s build' if digest == REFERENCE.get(key) else \
+                'not byte-identical to the author\'s build (other library versions can do this; it is fine if the item looks right in game)'
+            log(f'  built {model["bundle"]}, {len(data) / 1e6:.1f} MB: {same}')
+            log(f'  sha256 {digest}', show=False)
+    # The mod folder holds every clip-on, so keep the other entries (the shipped AN/PVS-30, the other script's
+    # bundles) and replace only this script's.
+    path, ours = args.mod / 'bundles.json', {m['bundle'] for m in MODELS.values()}
+    entries = json.loads(path.read_text(encoding='utf-8')).get('manifest', []) if path.exists() else []
+    entries = [e for e in entries if e.get('key') not in ours]
+    entries += [{'key': m['bundle'], 'dependencyKeys': m['deps']} for m in MODELS.values()]
+    path.write_text(json.dumps({'manifest': entries}, indent=2), encoding='utf-8')
+    log('bundles.json updated')
+
+
+def main():
+    global LOG
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('models', type=Path, nargs='?', help='the downloaded zip, or the folder holding it (default: this mod\'s folder)')
+    ap.add_argument('--mod', type=Path, default=Path(__file__).resolve().parent, help='this mod\'s folder (default: where this script is)')
+    add_options(ap)
+    args = ap.parse_args()
+    log_path = args.mod / (Path(__file__).stem + '.log')
+    try:
+        LOG = open(log_path, 'w', encoding='utf-8')
+    except OSError:
+        log_path = Path(tempfile.gettempdir()) / (Path(__file__).stem + '.log')
+        LOG = open(log_path, 'w', encoding='utf-8')
+    try:
+        run(args)
+    except BaseException as error:
+        if isinstance(error, SystemExit) and isinstance(error.code, str):
+            log('ERROR: ' + error.code)
+        elif isinstance(error, KeyboardInterrupt):
+            log('stopped')
+        else:
+            log('ERROR: ' + (str(error) or type(error).__name__))
+            log(traceback.format_exc(), show=False)
+        log(f'\nNo usable bundle was made. The log is {log_path}.\n'
+            f'If you cannot fix it from the message above, open an issue at {ISSUES} and attach that file.')
+        raise SystemExit(1)
+    log(f'\nDone: start the SPT server, and {SOURCE["title"]} is in the game. (The log is {log_path}.)')
